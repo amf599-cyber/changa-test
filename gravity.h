@@ -18,8 +18,10 @@ struct BucketNodeTerm {
 };
 
 /// A source particle queued for the same batched kernel as nodes.
-/// base is offset + source position, precomputed in the scalar order.
+/// base is the raw source position; off is the periodic offset, applied as
+/// -packedPos + off + base to match the fork's SIMD operand order.
 struct BucketPartTerm {
+  Vector3D<cosmoType> off;
   Vector3D<cosmoType> base;
   cosmoType mass;
   cosmoType soft;
@@ -361,12 +363,13 @@ inline void termBatchSoA(const BucketNodeTerm *nodes,
     for (int k=0; k<nt; ++k) {
     if (order[k] < 0) {
       const BucketPartTerm &p = parts[~order[k]];
+      Vector3D<SSEcosmoType> offV(SSEcosmoType(p.off.x),
+				  SSEcosmoType(p.off.y),
+				  SSEcosmoType(p.off.z));
       Vector3D<SSEcosmoType> baseV(SSEcosmoType(p.base.x),
 				   SSEcosmoType(p.base.y),
 				   SSEcosmoType(p.base.z));
-      // Operand order matches the scalar path: (offset + source) - packedPos.
-      // The fork's SSE path computes -packedPos + offset + part
-      r = baseV - packedPos;
+      r = -packedPos + offV + baseV;
       rsq = r.lengthSquared();
       twoh = SSEcosmoType(p.soft) + packedSoft;
       SSEMask select = rsq > COSMO_CONST(0.0);
@@ -438,7 +441,7 @@ inline void termBatchSoA(const BucketNodeTerm *nodes,
 // Runs one particle source through termBatchSoA as a single-term batch.
 inline void partKernelSoA(ExternalGravityParticle *part, const ActiveSoA &s,
 			  int nPad, Vector3D<cosmoType> offset) {
-  BucketPartTerm t = {offset + part->position, part->mass, part->soft};
+  BucketPartTerm t = {offset, part->position, part->mass, part->soft};
   int idx = -1;
   termBatchSoA(nullptr, &t, &idx, 1, s, nPad);
 }
@@ -745,7 +748,7 @@ inline int partBucketForce(ExternalGravityParticle *part,
   // Unstaged: scalar-equivalent path.
   if (bs.staged) {
     bs.order.push_back(~(int)bs.parts.size());
-    bs.parts.push_back(BucketPartTerm{offset + part->position,
+    bs.parts.push_back(BucketPartTerm{offset, part->position,
 				      part->mass, part->soft});
     if ((int)bs.order.size() >= TERM_BATCH_MAX)
       flushTerms(bs);
@@ -777,7 +780,7 @@ inline int nodeBucketForce(Tree::GenericTreeNode *node,
 #ifdef HEXADECAPOLE
     if(openSoftening(node, req, offset)) {
       bs.order.push_back(~(int)bs.parts.size());
-      bs.parts.push_back(BucketPartTerm{offset + m.cm,
+      bs.parts.push_back(BucketPartTerm{offset, m.cm,
 					m.totalMass, m.soft});
       if ((int)bs.order.size() >= TERM_BATCH_MAX)
 	flushTerms(bs);
