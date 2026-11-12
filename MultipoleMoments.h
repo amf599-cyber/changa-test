@@ -102,8 +102,6 @@ void momEvalMomr(MOMR *m,SSEcosmoType dir0,SSEcosmoType x,SSEcosmoType y,
 	dir *= mf(m->m);
 	dir2 *= -(dir + COSMO_CONST(5.0)*g2 + COSMO_CONST(7.0)*g3
 		  + COSMO_CONST(9.0)*g4);
-	dir2 *= -(dir + COSMO_CONST(5.0)*g2 + COSMO_CONST(7.0)*g3
-		  + COSMO_CONST(9.0)*g4);
 	*fPot += dir + g2 + g3 + g4;
 	*ax += xx + xxx + tx + x*dir2;
 	*ay += xy + xxy + ty + y*dir2;

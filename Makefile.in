@@ -14,7 +14,8 @@ build_dir := @builddir@
 # and destination file mappings. They can also be used by subprojects.
 define compile-cxx
 @ echo Compiling $*.cpp...
-$(quiet) $(charmc) $(cxx_flags) $(depend_flags) $(depend_dir)/$*$(depend_suffix) -c $< -o $@
+$(quiet) $(charmc) $(cxx_flags) $(depend_flags) \
+	$(depend_dir)/$*$(depend_suffix) -c++-option -std=$(cxx_std) -c $< -o $@
 endef
 
 define compile-c

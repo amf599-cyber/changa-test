@@ -9,7 +9,6 @@
 #include "Vector3D.h"
 #include "TaggedVector3D.h"
 #include "OrientedBox.h"
-using namespace std;
 
 #define XDIM 0
 #define YDIM 1
