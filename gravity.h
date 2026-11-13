@@ -44,13 +44,12 @@ enum { FORCE_SOA_FIELDS = 10 };
 /// Padded SoA of one bucket's active particles, with FORCE_SOA_FIELDS arrays
 /// of nPad lanes each. Lanes from n to nPad are zeroed so whole SIMD vectors
 /// can be loaded; the kernels' masks keep those lanes from contributing, and
-/// scatter() never writes them back. Owning storage lives in buf; the
-/// no-bucket fallbacks bind the pointers to stack memory via bind().
+/// suspendBucket reads only the first n lanes back.
 /// @var n     Number of active particles.
 /// @var nPad  n rounded up to a multiple of SSE_VECTOR_WIDTH.
-/// @var buf   Owned storage (empty when bound to caller memory).
-/// @var px..az  Pointers into buf (or bound memory): position, softening,
-///            mass, and dtGrav inputs; potential and acceleration outputs.
+/// @var buf   Owned storage that the pointers below index into.
+/// @var px..az  Pointers into buf: position, softening, mass, and dtGrav
+///            inputs; potential and acceleration outputs.
 struct ActiveSoA {
   int n;
   int nPad;
@@ -113,47 +112,32 @@ struct ActiveSoA {
       az[i] = p ? p->treeAcceleration.z : 0.0;
     }
   }
-
-  /// Writes acceleration, potential and dtGrav back to the AoS.
-  void scatter(GravityParticle **act) const {
-    for (int i = 0; i < n; ++i) {
-      GravityParticle *p = act[i];
-      p->treeAcceleration.x = ax[i];
-      p->treeAcceleration.y = ay[i];
-      p->treeAcceleration.z = az[i];
-      p->potential = potential[i];
-      p->dtGrav = dtGrav[i];
-    }
-  }
 };
 
 /// Per-bucket staging of active particles. One is owned by each TreePiece
-/// bucket. It is gathered once when the bucket is staged and scattered back
+/// bucket. It is gathered once when the bucket is staged and written back
 /// when it is suspended or finished (finishBucket).
 /// Node and particle terms share one walk-ordered queue: order[k] >= 0
 /// indexes nodes, order[k] < 0 indexes parts as ~order[k]. flushTerms
 /// applies them in that order, so each particle's accumulation matches the
 /// scalar walk.
 /// @var staged  True while soa holds gathered particles for this bucket.
-/// @var done    True once unstageBucket has run for this walk; the bucket is
-///              then never restaged and the AoS path is used. Cleared at the
-///              start of each walk (TreePiece.cpp).
-/// @var activeRung  Lowest rung that counts as active for this bucket.
 /// @var soa     Padded SoA of the active particles.
 /// @var nodes   Queued node terms (copied moments, walk order).
 /// @var parts   Queued particle terms (offset + position precomputed).
 /// @var order   Walk-order index into nodes (>= 0) or parts (~value < 0).
-/// @var act     Active particles in gather order; scatter target.
+/// @var act     Active particles in gather order; suspendBucket writes back to them.
 struct BucketSoA {
   bool staged;
-  bool done;
-  int activeRung;
   ActiveSoA soa;
   std::vector<BucketNodeTerm> nodes;
   std::vector<BucketPartTerm> parts;
   std::vector<int> order;
   std::vector<GravityParticle*> act;
-  BucketSoA() : staged(false), done(false), activeRung(0) {}
+  /// AoS treeAcceleration at stage time (x,y,z per particle). Other writers
+  /// may add to the AoS while staged, so suspendBucket adds only the gravity delta.
+  std::vector<cosmoType> snapAcc;
+  BucketSoA() : staged(false) {}
 };
 
 /*
@@ -164,21 +148,6 @@ struct BucketSoA {
 ** Higher derivative terms c and d for use with quadrupole spline
 ** softening (Joachim Stadel, Dec. 94).
 */
-// Lane-wise m ? t : f. A pure copy, so every selected value is bit-exact.
-// In-line where masks used for regime selection in SPLINEQ function.
-inline SSEcosmoType sseSelect(SSEMask m, SSEcosmoType t, SSEcosmoType f) {
-  stdx::where(m, f) = t;
-  return f;
-}
-// m ? x : +0.0 per lane (zeroes masked-off lanes, which may hold inf/NaN).
-inline SSEcosmoType sseAnd(SSEMask m, SSEcosmoType x) {
-  return sseSelect(m, x, SSEcosmoType(COSMO_CONST(0.0)));
-}
-// Same lane semantics as Charm's _mm_max_pd(a, b): a > b ? a : b.
-inline SSEcosmoType sseMax(SSEcosmoType a, SSEcosmoType b) {
-  return sseSelect(a > b, a, b);
-}
-
 inline
 void SPLINEQ(SSEcosmoType invr, SSEcosmoType r2, SSEcosmoType twoh,
 	     SSEcosmoType& a, SSEcosmoType& b, 
@@ -188,7 +157,7 @@ void SPLINEQ(SSEcosmoType invr, SSEcosmoType r2, SSEcosmoType twoh,
   SSEMask select0 = r2 < twoh * twoh;
   // Common case: no lane inside the softening radius. Same arithmetic as the
   // a0..d0 regime below, so results are bit-identical.
-  if (stdx::none_of(select0)) {
+  if (sseNone(select0)) {
     a = dir;
     b = dir*dir*dir;
     c = COSMO_CONST(3.0)*b*dir*dir;
@@ -257,7 +226,7 @@ void SPLINE(SSEcosmoType r2, SSEcosmoType twoh,
 {
   SSEcosmoType r = sqrt(r2);
   SSEMask select0 = r < twoh;
-  if (stdx::none_of(select0)) {
+  if (sseNone(select0)) {
     a = COSMO_CONST(1.0)/r;
     b = a*a*a;
     return;
@@ -349,17 +318,13 @@ inline void termBatchSoA(const BucketNodeTerm *nodes,
     }
 #endif
     Vector3D<SSEcosmoType> 
-      packedPos(SSELoad(SSEcosmoType, s.px, i, ),
-		SSELoad(SSEcosmoType, s.py, i, ),
-		SSELoad(SSEcosmoType, s.pz, i, )); 
+      packedPos(sseLoad(s.px + i), sseLoad(s.py + i), sseLoad(s.pz + i)); 
     Vector3D<SSEcosmoType> 
-      packedAcc(SSELoad(SSEcosmoType, s.ax, i, ),
-		SSELoad(SSEcosmoType, s.ay, i, ),
-		SSELoad(SSEcosmoType, s.az, i, )); 
-    SSEcosmoType SSELoad(packedPotential, s.potential, i, ); 
-    SSEcosmoType SSELoad(packedMass, s.mass, i, );  
-    SSEcosmoType SSELoad(packedDtGrav, s.dtGrav, i, );
-    SSEcosmoType SSELoad(packedSoft, s.soft, i, );
+      packedAcc(sseLoad(s.ax + i), sseLoad(s.ay + i), sseLoad(s.az + i)); 
+    SSEcosmoType packedPotential = sseLoad(s.potential + i);
+    SSEcosmoType packedMass = sseLoad(s.mass + i);
+    SSEcosmoType packedDtGrav = sseLoad(s.dtGrav + i);
+    SSEcosmoType packedSoft = sseLoad(s.soft + i);
     for (int k=0; k<nt; ++k) {
     if (order[k] < 0) {
       const BucketPartTerm &p = parts[~order[k]];
@@ -374,7 +339,7 @@ inline void termBatchSoA(const BucketNodeTerm *nodes,
       twoh = SSEcosmoType(p.soft) + packedSoft;
       SSEMask select = rsq > COSMO_CONST(0.0);
       // Matches partBucketForce: no active lane, so skip the spline and update.
-      if (stdx::none_of(select)) continue;
+      if (sseNone(select)) continue;
       SPLINE(rsq, twoh, a, b);
       a = sseAnd(select, a);
       b = sseAnd(select, b);
@@ -391,7 +356,7 @@ inline void termBatchSoA(const BucketNodeTerm *nodes,
     rsq = r.lengthSquared();
     SSEMask select = rsq > COSMO_CONST(0.0);
     // Self and padded lanes only: nothing to accumulate.
-    if (stdx::none_of(select)) continue;
+    if (sseNone(select)) continue;
     /* Masked-off lanes: 1/sqrt(0) is inf for self and padded lanes. */
     SSEcosmoType dir = sseAnd(select, COSMO_CONST(1.0)/sqrt(rsq));
 #ifdef HEXADECAPOLE
@@ -429,66 +394,12 @@ inline void termBatchSoA(const BucketNodeTerm *nodes,
     idt2 = sseMax(idt2, packedDtGrav);
     packedDtGrav = idt2;
     }
-    SSEStore(packedAcc.x, s.ax, i, );
-    SSEStore(packedAcc.y, s.ay, i, );
-    SSEStore(packedAcc.z, s.az, i, );
-    SSEStore(packedPotential, s.potential, i, );
-    SSEStore(packedDtGrav, s.dtGrav, i, ); 
+    sseStore(s.ax + i, packedAcc.x);
+    sseStore(s.ay + i, packedAcc.y);
+    sseStore(s.az + i, packedAcc.z);
+    sseStore(s.potential + i, packedPotential);
+    sseStore(s.dtGrav + i, packedDtGrav); 
   }
-}
-
-// Masked SIMD partBucketForce kernel over padded SoA lanes.
-// Runs one particle source through termBatchSoA as a single-term batch.
-inline void partKernelSoA(ExternalGravityParticle *part, const ActiveSoA &s,
-			  int nPad, Vector3D<cosmoType> offset) {
-  BucketPartTerm t = {offset, part->position, part->mass, part->soft};
-  int idx = -1;
-  termBatchSoA(nullptr, &t, &idx, 1, s, nPad);
-}
-
-inline int partBucketForce(ExternalGravityParticle *part, 
-			   Tree::GenericTreeNode *req, 
-			   GravityParticle **activeParticles, 
-			   Vector3D<cosmoType> offset, int nActiveParts) {
-  ActiveSoA s;
-  s.bind((cosmoType*)alloca(FORCE_SOA_FIELDS * ActiveSoA::padded(nActiveParts)
-			    * sizeof(cosmoType)), nActiveParts);
-  s.gather(activeParticles);
-  partKernelSoA(part, s, s.nPad, offset);
-  s.scatter(activeParticles);
-  return nActiveParts;
-}
-
-inline int partBucketForce(ExternalGravityParticle *part, 
-			   Tree::GenericTreeNode *req, 
-			   GravityParticle *particles, 
-			   Vector3D<cosmoType> offset, int activeRung) {
-  int nActiveParts = 0; 
-  GravityParticle **activeParticles = 
-    (GravityParticle**)alloca((req->lastParticle - req->firstParticle 
-			       + 1 + FORCE_INPUT_LIST_PAD) 
-			      * sizeof(GravityParticle*));
-  for (int j=req->firstParticle; j <= req->lastParticle; ++j) {
-    if (particles[j].rung >= activeRung) 
-      activeParticles[nActiveParts++] = &particles[j];
-  }
-  
-  int ret = partBucketForce(part, req, activeParticles, offset, nActiveParts); 
-  return ret; 
-}
-
-//
-// Calculated forces on active particles in a bucket due to the
-// multipole of a TreeNode.  Return number of multipoles evaluated.
-//
-
-// Runs one node's moments through termBatchSoA as a single-term batch. Used by
-// the unstaged nodeBucketForce path; staged buckets queue terms instead.
-inline void nodeKernelSoA(const MultipoleMoments &m, Vector3D<cosmoType> cm,
-			  const ActiveSoA &s, int nPad) {
-  BucketNodeTerm t = {m, cm};
-  int idx = 0;
-  termBatchSoA(&t, nullptr, &idx, 1, s, nPad);
 }
 
 /// Applies all queued node and particle terms to the bucket's SoA in walk
@@ -501,50 +412,6 @@ inline void flushTerms(BucketSoA &bs) {
   bs.nodes.clear();
   bs.parts.clear();
   bs.order.clear();
-}
-
-//
-// Calculated forces on active particles in a bucket due to the
-// multipole of a TreeNode.  Return number of multipoles evaluated.
-//
-inline
-int nodeBucketForce(Tree::GenericTreeNode *node, 
-		    Tree::GenericTreeNode *req,  
-		    GravityParticle *particles, 
-		    Vector3D<cosmoType> offset,    
-		    int activeRung)
-{
-  const MultipoleMoments &m = node->moments;
-  Vector3D<cosmoType> cm(m.cm + offset);
-  int nActiveParts = 0;
-
-  GravityParticle **activeParticles = 
-    (GravityParticle**)alloca((req->lastParticle - req->firstParticle 
-		       + 1 + FORCE_INPUT_LIST_PAD) 
-		      * sizeof(GravityParticle*));
-  for (int j=req->firstParticle; j <= req->lastParticle; ++j) {
-    if (particles[j].rung >= activeRung) 
-      activeParticles[nActiveParts++] = &particles[j];
-  }
-
-#ifdef HEXADECAPOLE
-  if(openSoftening(node, req, offset)) {
-    ExternalGravityParticle tmpPart;
-    tmpPart.mass = m.totalMass;
-    tmpPart.soft = m.soft;
-    tmpPart.position = m.cm;
-    int ret = partBucketForce(&tmpPart, req, activeParticles, 
-			   offset, nActiveParts);
-    return ret; 
-    }
-#endif
-  ActiveSoA s;
-  s.bind((cosmoType*)alloca(FORCE_SOA_FIELDS * ActiveSoA::padded(nActiveParts)
-			    * sizeof(cosmoType)), nActiveParts);
-  s.gather(activeParticles);
-  nodeKernelSoA(m, cm, s, s.nPad);
-  s.scatter(activeParticles);
-  return nActiveParts;
 }
 
 /// @brief Gravity opening criterion for a bucket walk.
@@ -690,12 +557,12 @@ inline int openCriterionNode(Tree::GenericTreeNode *node,
 }
 
 // Bucket-level staging. stageBucket gathers the bucket's active particles
-// into bs once; the bucket overloads below run on that SoA until
-// unstageBucket scatters the results back to the AoS particles and marks the
-// bucket done (see BucketSoA::done). Used when the walk for a bucket ends.
+// into bs. The bucket overloads below queue terms on that SoA until
+// suspendBucket writes the results back to the AoS particles.
+// suspendBucket releases the SoA; a later bucketSoAFor restages it from the
+// AoS, which already holds the accumulated values.
 inline void stageBucket(BucketSoA &bs, Tree::GenericTreeNode *req,
 			GravityParticle *particles, int activeRung) {
-  bs.activeRung = activeRung;
   bs.act.clear();
   bs.nodes.clear();
   bs.parts.clear();
@@ -709,91 +576,86 @@ inline void stageBucket(BucketSoA &bs, Tree::GenericTreeNode *req,
   }
   bs.soa.allocate((int)bs.act.size());
   bs.soa.gather(bs.act.data());
+  bs.snapAcc.resize(3 * bs.act.size());
+  for (size_t i = 0; i < bs.act.size(); ++i) {
+    bs.snapAcc[3*i] = bs.act[i]->treeAcceleration.x;
+    bs.snapAcc[3*i+1] = bs.act[i]->treeAcceleration.y;
+    bs.snapAcc[3*i+2] = bs.act[i]->treeAcceleration.z;
+  }
   bs.staged = true;
 }
 
 // Flushes queued terms and writes the SoA back to the AoS, releasing the
-// SoA. Leaves the bucket restageable (unlike unstageBucket) so it can be
-// suspended around Ewald, which adds to the AoS directly.
+// SoA. Leaves the bucket restageable so it can be suspended around Ewald,
+// which adds to the AoS directly, and finished once the walk ends.
 inline void suspendBucket(BucketSoA &bs) {
   if (bs.staged) {
     flushTerms(bs);
-    bs.soa.scatter(bs.act.data());
+    for (int i = 0; i < bs.soa.n; ++i) {
+      GravityParticle *p = bs.act[i];
+      // Assign unless the AoS changed while staged; then keep that external delta.
+      // Assigning avoids rounding (soa - snap) + aos, which is not bit-exact in float.
+      if (p->treeAcceleration.x != bs.snapAcc[3*i])
+        p->treeAcceleration.x = bs.soa.ax[i] + (p->treeAcceleration.x - bs.snapAcc[3*i]);
+      else p->treeAcceleration.x = bs.soa.ax[i];
+      if (p->treeAcceleration.y != bs.snapAcc[3*i+1])
+        p->treeAcceleration.y = bs.soa.ay[i] + (p->treeAcceleration.y - bs.snapAcc[3*i+1]);
+      else p->treeAcceleration.y = bs.soa.ay[i];
+      if (p->treeAcceleration.z != bs.snapAcc[3*i+2])
+        p->treeAcceleration.z = bs.soa.az[i] + (p->treeAcceleration.z - bs.snapAcc[3*i+2]);
+      else p->treeAcceleration.z = bs.soa.az[i];
+      p->potential = bs.soa.potential[i];
+      p->dtGrav = bs.soa.dtGrav[i];
+    }
   }
   bs.staged = false;
   bs.soa.release();
   std::vector<GravityParticle*>().swap(bs.act);
 }
 
-inline void unstageBucket(BucketSoA &bs) {
-  suspendBucket(bs);
-  bs.done = true;
-}
-
-/// Bucket overload of partBucketForce. When bs is staged the source term is
-/// queued (flushed at TERM_BATCH_MAX); otherwise it runs the scalar path.
+/// Bucket overload of partBucketForce. Queues the source term on the staged
+/// bucket (flushed at TERM_BATCH_MAX).
 /// @param part       Source particle.
-/// @param req        Bucket node the walk is evaluating.
-/// @param particles  AoS particles of the TreePiece (unstaged path).
 /// @param offset     Periodic offset applied to the source.
-/// @param activeRung Lowest active rung (unstaged path).
-/// @param bs         Bucket staging state.
+/// @param bs         Staged bucket state.
 /// @return           Number of active particles in the bucket.
 inline int partBucketForce(ExternalGravityParticle *part,
-			   Tree::GenericTreeNode *req,
-			   GravityParticle *particles,
-			   Vector3D<cosmoType> offset, int activeRung,
-			   BucketSoA &bs) {
-  // Staged: queue the source term in walk order.
-  // Unstaged: scalar-equivalent path.
-  if (bs.staged) {
-    bs.order.push_back(~(int)bs.parts.size());
-    bs.parts.push_back(BucketPartTerm{offset, part->position,
-				      part->mass, part->soft});
-    if ((int)bs.order.size() >= TERM_BATCH_MAX)
-      flushTerms(bs);
-    return bs.soa.n;
-  }
-  return partBucketForce(part, req, particles, offset, activeRung);
+			   Vector3D<cosmoType> offset, BucketSoA &bs) {
+  bs.order.push_back(~(int)bs.parts.size());
+  bs.parts.push_back(BucketPartTerm{offset, part->position,
+				    part->mass, part->soft});
+  if ((int)bs.order.size() >= TERM_BATCH_MAX)
+    flushTerms(bs);
+  return bs.soa.n;
 }
 
-/// Bucket overload of nodeBucketForce. When bs is staged the node moments are
-/// queued (or a particle term if softening opens the node); otherwise it runs
-/// the scalar path.
+/// Bucket overload of nodeBucketForce. Queues the node moments on the staged
+/// bucket, or a particle term if softening opens the node.
 /// @param node       Source tree node.
 /// @param req        Bucket node the walk is evaluating.
-/// @param particles  AoS particles of the TreePiece (unstaged path).
 /// @param offset     Periodic offset applied to the node.
-/// @param activeRung Lowest active rung (unstaged path).
-/// @param bs         Bucket staging state.
+/// @param bs         Staged bucket state.
 /// @return           Number of active particles in the bucket.
 inline int nodeBucketForce(Tree::GenericTreeNode *node,
 			   Tree::GenericTreeNode *req,
-			   GravityParticle *particles,
-			   Vector3D<cosmoType> offset, int activeRung,
-			   BucketSoA &bs) {
-  // Staged: queue the node (or a particle term if softening opens it), as in
-  // scalar nodeBucketForce. The HEXADECAPOLE branch matches the scalar path.
-  if (bs.staged) {
-    const MultipoleMoments &m = node->moments;
-    Vector3D<cosmoType> cm(m.cm + offset);
+			   Vector3D<cosmoType> offset, BucketSoA &bs) {
+  const MultipoleMoments &m = node->moments;
+  Vector3D<cosmoType> cm(m.cm + offset);
 #ifdef HEXADECAPOLE
-    if(openSoftening(node, req, offset)) {
-      bs.order.push_back(~(int)bs.parts.size());
-      bs.parts.push_back(BucketPartTerm{offset, m.cm,
-					m.totalMass, m.soft});
-      if ((int)bs.order.size() >= TERM_BATCH_MAX)
-	flushTerms(bs);
-      return bs.soa.n;
-    }
-#endif
-    bs.order.push_back((int)bs.nodes.size());
-    bs.nodes.push_back(BucketNodeTerm{m, cm});
+  if(openSoftening(node, req, offset)) {
+    bs.order.push_back(~(int)bs.parts.size());
+    bs.parts.push_back(BucketPartTerm{offset, m.cm,
+				      m.totalMass, m.soft});
     if ((int)bs.order.size() >= TERM_BATCH_MAX)
       flushTerms(bs);
     return bs.soa.n;
   }
-  return nodeBucketForce(node, req, particles, offset, activeRung);
+#endif
+  bs.order.push_back((int)bs.nodes.size());
+  bs.nodes.push_back(BucketNodeTerm{m, cm});
+  if ((int)bs.order.size() >= TERM_BATCH_MAX)
+    flushTerms(bs);
+  return bs.soa.n;
 }
 
 #endif

@@ -299,8 +299,8 @@ void GravityCompute::recvdParticles(ExternalGravityParticle *part,int num,int ch
 #ifdef HPM_COUNTER
     hpmStart(2,"particle force");
 #endif
-    computed = partBucketForce(&part[i], reqnode, tp->myParticles, offset,
-        activeRung, tp->bucketSoAFor(reqIDlist, reqnode, activeRung));
+    computed = partBucketForce(&part[i], offset,
+        tp->bucketSoAFor(reqIDlist, reqnode, activeRung));
 #ifdef HPM_COUNTER
     hpmStop(2);
 #endif
@@ -441,9 +441,7 @@ int GravityCompute::doWork(GenericTreeNode *node, TreeWalk *tw,
 #endif
     int computed = nodeBucketForce(node,
                     (GenericTreeNode *)computeEntity,
-                    tp->getParticles(),
                     tp->decodeOffset(reqID),
-                    activeRung,
                     tp->bucketSoAFor(decodeReqID(reqID),
                                      (GenericTreeNode *)computeEntity,
                                      activeRung));
@@ -495,10 +493,7 @@ int GravityCompute::doWork(GenericTreeNode *node, TreeWalk *tw,
       for(int i = node->firstParticle; i <= node->lastParticle; i++){
         computed += partBucketForce(
                                   &part[i-node->firstParticle],
-                                  (GenericTreeNode *)computeEntity,
-                                  tp->getParticles(),
                                   offset,
-                                  activeRung,
                                   bs);
 
         GenericTreeNode *b = (GenericTreeNode *)computeEntity;
@@ -610,10 +605,7 @@ int GravityCompute::computeParticleForces(TreePiece *ownerTP, GenericTreeNode *n
   for(int i = node->firstParticle; i <= node->lastParticle; i++){
     computed += partBucketForce(
                                   &part[i-node->firstParticle],
-                                  (GenericTreeNode *)computeEntity,
-                                  ownerTP->getParticles(),
                                   ownerTP->decodeOffset(reqID),
-                                  activeRung,
                                   bs);
   }
 #ifdef BENCHMARK_TIME_COMPUTE
@@ -1319,7 +1311,6 @@ void ListCompute::fillLists(State *state_, TreePiece *tp, int chunk, int start,
 template<class type> int calcNodeForces(TreePiece *tp, int b, int activeRung,
     CkVec<type>& clist) {
 
-  GravityParticle *particles = tp->getParticles();
   int computed = 0;
   for(unsigned int i = 0; i < clist.length(); i++){
 
@@ -1336,8 +1327,7 @@ template<class type> int calcNodeForces(TreePiece *tp, int b, int activeRung,
 #endif
     computed +=  nodeBucketForce(clist[i].node,
         tp->getBucket(b),
-        particles,
-        tp->decodeOffset(clist[i].offsetID), activeRung,
+        tp->decodeOffset(clist[i].offsetID),
         tp->bucketSoAFor(b, tp->getBucket(b), activeRung));
 #ifdef CHANGA_REFACTOR_PRINT_INTERACTIONS
     if(b == TEST_BUCKET && tp->getIndex() == TEST_TP){
@@ -1352,7 +1342,6 @@ template<class type> int calcNodeForces(TreePiece *tp, int b, int activeRung,
 template<class type> int calcParticleForces(TreePiece *tp, int b, int activeRung,
     CkVec<type>& clist) {
 
-  GravityParticle *particles = tp->getParticles();
   int computed = 0;
   // for each bunch of particles in list
   for(unsigned int i = 0; i < clist.length(); i++){
@@ -1367,9 +1356,7 @@ template<class type> int calcParticleForces(TreePiece *tp, int b, int activeRung
     // for each particle in a bunch
     for(int j = 0; j < cli.numParticles; j++){
       computed +=  partBucketForce(&cli.particles[j],
-          tp->getBucket(b),
-          particles,
-          cli.offset, activeRung,
+          cli.offset,
           tp->bucketSoAFor(b, tp->getBucket(b), activeRung));
 
 #ifdef CHANGA_REFACTOR_PRINT_INTERACTIONS
@@ -1540,9 +1527,8 @@ void ListCompute::stateReady(State *state_, TreePiece *tp, int chunk, int start,
 	      tmpPart.soft = m.soft;
 	      tmpPart.position = m.cm;
 
-	      GravityParticle *particles = tp->getParticles();
-	      partBucketForce(&tmpPart, bucketNode, particles,
-			      tp->decodeOffset(clist[i].offsetID), activeRung,
+	      partBucketForce(&tmpPart,
+			      tp->decodeOffset(clist[i].offsetID),
 			      tp->bucketSoAFor(b, bucketNode, activeRung));
 	      continue;
 	    }

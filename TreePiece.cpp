@@ -3707,7 +3707,6 @@ int TreePiece::initBuckets() {
       }
     }
     bucketReqs[j].finished = ewaldCondition;
-    bucketSoA[j].done = false;
 
 /*#if COSMO_DEBUG > 1
     if(iterationNo==1 || listMigrated==true){
@@ -3813,15 +3812,14 @@ void TreePiece::startNextBucket() {
 #endif
 }
 
-/// Stages bucket b's active particles into its SoA on first use. Staging can
-/// happen during the walk; calculateEwald/callBucketEwald suspend the bucket
-/// (writing results back to the AoS) before Ewald adds to the particles, and
-/// it is restaged from the AoS afterwards. After the bucket is done
-/// (scattered in finishBucket) the AoS path is used as before.
+/// Stages bucket b's active particles into its SoA when it is not already
+/// staged. Staging can happen during the walk; calculateEwald/callBucketEwald
+/// and finishBucket suspend the bucket (writing results back to the AoS). A
+/// later call restages it from the AoS, which holds the accumulated values.
 BucketSoA &TreePiece::bucketSoAFor(int b, Tree::GenericTreeNode *req,
                                    int activeRung) {
   BucketSoA &bs = bucketSoA[b];
-  if (!bs.staged && !bs.done)
+  if (!bs.staged)
     stageBucket(bs, req, myParticles, activeRung);
   return bs;
 }
@@ -3843,7 +3841,7 @@ void TreePiece::finishBucket(int iBucket) {
 
   // XXX finished means Ewald is done.
   if(req->finished && remaining == 0) {
-    unstageBucket(bucketSoA[iBucket]);
+    suspendBucket(bucketSoA[iBucket]);
     sLocalGravityState->myNumParticlesPending -= 1;
 
 #ifdef COSMO_PRINT_BK
