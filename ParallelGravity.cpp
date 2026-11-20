@@ -2717,10 +2717,15 @@ void Main::setupICs() {
 #ifdef COLLISION
   ofsLog << " COLLISION";
 #endif
-#if defined(__AVX__)
-  ofsLog << " CMK_USE_AVX";
-#elif defined(__SSE2__)
+#ifdef CMK_USE_SSE2
   ofsLog << " CMK_USE_SSE2";
+#endif
+#ifdef CMK_USE_AVX
+  ofsLog << " CMK_USE_AVX";
+#endif
+// Logged when no legacy SIMD flag is set, i.e. the std::experimental::simd path.
+#ifndef CMK_SSE
+  ofsLog << " NATIVE_SIMD";
 #endif
 #ifdef COSMO_FLOAT
   ofsLog << " COSMO_FLOAT";

@@ -6,6 +6,11 @@ AC_INIT([ChaNGa], [3.5], [changa-users@u.washington.edu])
 AC_DEFINE_UNQUOTED([NBODY_PACKAGE_VERSION], [$PACKAGE_VERSION])
 AC_CONFIG_SRCDIR([Reductions.h])
 
+# Remove files produced by a previous configure run so a regenerated
+# configuration never mixes with stale settings. The list mirrors dist-clean
+# in Makefile.in; config.h.in and configure itself are sources and are kept.
+rm -f config.status config.log config.cache config.h Makefile cuda.mk ChaNGa charmrun
+
 # Save the user-provided flags
 # NOTE: This must be done _before_ the Charm scripts are imported
 #       as they provide their own values for these flags.
@@ -35,6 +40,12 @@ fi
 AC_CHECK_PROG(HAVE_GIT,[git],[yes],[no])
 test "$HAVE_GIT" == "no" && AC_MSG_ERROR([git not found])
 
+# Prerequisites for this build (SIMD layer in SSEdefs.h, gravity in gravity.h):
+#   - Charm++ at least MINIMUM_CHARM_VERSION (charmc from CHARM_DIR or PATH)
+#   - A C++17 compiler (-std=c++17) that ships <experimental/simd>:
+#     GCC >= 11 or Clang with libstdc++ >= 11
+#   - No Charm SIMD intrinsics are used; the arch selector reads compiler
+#     macros only, so it works on x86-64 and AArch64 alike.
 MINIMUM_CHARM_VERSION=60800
 if test $($CHARMC -V | awk '{print $3}') -lt $MINIMUM_CHARM_VERSION; then
 	AC_MSG_ERROR([[At least Charm++ $MINIMUM_CHARM_VERSION is required]])
@@ -95,8 +106,42 @@ fi
 # Compiler-specific options
 m4_include([compiler.ac])
 
-# Require C++11
-COMPILER_FLAG_REQUIRE([-std=c++11],[ChaNGa requires full C++11 support])
+# Language standard. C++17 is needed for native std::experimental::simd. If the
+# compiler lacks it, the build uses C++11 (the pristine fork's standard) and auto
+# falls back to a legacy-* mode.
+AC_LANG_PUSH([C++])
+AC_MSG_CHECKING([whether $CXX supports -std=c++17])
+ac_saved_cxxflags="$CXXFLAGS"
+CXXFLAGS="$CXXFLAGS -std=c++17"
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [[
+#if __cplusplus < 201703L
+#error not C++17
+#endif
+]])], [have_cxx17=yes], [have_cxx17=no])
+AC_MSG_RESULT([$have_cxx17])
+CXXFLAGS="$ac_saved_cxxflags"
+AC_LANG_POP([C++])
+if test x$have_cxx17 = xyes; then cxx_std=c++17; else cxx_std=c++11; fi
+AC_SUBST([CXX_STD],[$cxx_std])
+
+# Probe the std::experimental::simd header (Parallelism TS v2). Not fatal here:
+# auto uses the result to choose native or the legacy fallback, and explicit
+# native-family modes check it below. The legacy-* modes do not need it.
+AC_LANG_PUSH([C++])
+AC_MSG_CHECKING([for <experimental/simd>])
+ac_saved_cxxflags="$CXXFLAGS"
+CXXFLAGS="$CXXFLAGS -std=c++17"
+have_stdx_simd=no
+if test x$have_cxx17 = xyes; then
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <experimental/simd>]],
+[[
+  std::experimental::native_simd<float> v(1.0f);
+  (void) v;
+]])], [have_stdx_simd=yes])
+fi
+AC_MSG_RESULT([$have_stdx_simd])
+CXXFLAGS="$ac_saved_cxxflags"
+AC_LANG_POP([C++])
 
 # Require dependency-generation flags
 COMPILER_FLAG_REQUIRE([-MMD -MP -MF .dummy],[ChaNGa requires the dependency-generation flags '-MMD -MP -MF'])
@@ -136,44 +181,154 @@ AC_DEFUN([ARG_ENABLE],
 ARG_ENABLE([sse2], [DEPRECATED. Use --enable-arch=sse2], [flag_sse_deprecated], [sse2], [no])
 ARG_ENABLE([avx], [DEPRECATED. Use --enable-arch=avx], [flag_avx_deprecated], [avx], [no])
 # -----------------------
-AC_ARG_ENABLE([arch], [AS_HELP_STRING([--enable-arch=MODE], [SIMD mode: auto (default, probe host), sse2, avx, native])],
+AC_ARG_ENABLE([arch], [AS_HELP_STRING([--enable-arch=MODE], [SIMD mode: auto (default: native when the compiler has C++17 std::experimental::simd, else legacy-avx or legacy-sse2 by host ISA), native (widest the host supports via -march=native), avx512 (16/8 lanes), avx (8/4), sse2 (4/2), neon (ARM NEON, 128-bit: 4/2 lanes on AArch64, 4/0 on ARMv7 where double SIMD is absent), legacy-avx / legacy-sse2 (pristine fork Charm intrinsics path, x86 only)])],
 			  [arch=$enableval], [arch=auto])
-if test x$arch = xauto -a x$flag_sse_deprecated != x; then arch=$flag_sse_deprecated; fi
-if test x$arch = xauto -a x$flag_avx_deprecated != x; then arch=$flag_avx_deprecated; fi
-# auto: pick the widest double-precision mode this host supports. Float is never chosen
+if test x$arch = xauto -a x$flag_sse_deprecated != x; then arch=legacy-sse2; fi
+if test x$arch = xauto -a x$flag_avx_deprecated != x; then arch=legacy-avx; fi
+# auto: the default. If the compiler provides C++17 std::experimental::simd (and
+# the host has a SIMD target), use native: the widest vectors -march=native gives
+# (AVX-512, AVX, SSE2, or ARM NEON). If it does not, fall back to the legacy mode
+# that matches the host ISA: legacy-avx for AVX, legacy-sse2 for SSE2. A host with
+# neither has no usable SIMD path, so configure stops. Float is never chosen
 # automatically; use --enable-float for it.
 if test x$arch = xauto; then
-	AC_LANG_PUSH([C++])
-	ac_save_CXXFLAGS=$CXXFLAGS
-	CXXFLAGS="$CXXFLAGS -march=native"
-	AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [[
+	if test x$have_stdx_simd = xyes; then
+		arch=native
+	else
+		AC_LANG_PUSH([C++])
+		ac_save_CXXFLAGS=$CXXFLAGS
+		CXXFLAGS="$CXXFLAGS -march=native"
+		AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [[
 #if !defined(__AVX__)
 #error no AVX on this host
 #endif
-]])], [arch=native], [arch=sse2])
-	AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [[
-#if !defined(__AVX512F__)
-#error no AVX-512 on this host
+]])], [arch=legacy-avx], [arch=])
+		if test x$arch = x; then
+			AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [[
+#if !defined(__x86_64__) && !defined(__i386__)
+#error not x86
 #endif
-]])], [avx512_host=yes], [avx512_host=no])
+]])], [arch=legacy-sse2], [arch=])
+		fi
+		if test x$arch = x; then
+			AC_MSG_ERROR([no usable SIMD path: the compiler lacks C++17 <experimental/simd> and the host has neither AVX nor SSE2 for the legacy fallback. Use a compiler with C++17 std::experimental::simd (GCC 11+ with libstdc++).])
+		fi
+		CXXFLAGS=$ac_save_CXXFLAGS
+		AC_LANG_POP([C++])
+	fi
+	AC_MSG_NOTICE([auto: selected SIMD mode is $arch])
+fi
+# Explicit native-family modes need std::experimental::simd; legacy-* modes do not.
+if test x$have_stdx_simd = xno; then
+	case $arch in
+		legacy-* ) ;;
+		* ) AC_MSG_ERROR([--enable-arch=$arch requires C++17 <experimental/simd> (GCC >= 11); use a legacy-* mode or a newer compiler]) ;;
+	esac
+fi
+# neon: the target's own NEON flags. AArch64 has NEON built in, so -march=armv8-a is
+# enough. 32-bit ARM needs ARMv7 NEON enabled explicitly. The probe makes the choice
+# from the compiler's view of the target, so cross builds get the right flags.
+if test x$arch = xneon; then
+	AC_LANG_PUSH([C++])
+	ac_save_CXXFLAGS=$CXXFLAGS
+	AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [[
+#if !defined(__ARM_NEON)
+#error no ARM NEON on this target
+#endif
+#if !defined(__aarch64__)
+#error not AArch64
+#endif
+]])], [neon_flags="-march=armv8-a"], [neon_flags=])
+	if test x"$neon_flags" = x; then
+		AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [[
+#if !defined(__ARM_NEON)
+#error no ARM NEON on this target
+#endif
+]])], [neon_flags="-march=armv7-a -mfpu=neon"], [AC_MSG_ERROR([--enable-arch=neon requires an ARM target with NEON])])
+	fi
 	CXXFLAGS=$ac_save_CXXFLAGS
 	AC_LANG_POP([C++])
-	AC_MSG_NOTICE([auto: host SIMD mode is $arch (AVX-512 host: $avx512_host)])
-	if test x$avx512_host = xyes; then
-		AC_MSG_WARN([AVX-512 host: -march=native selects 8-lane double kernels. Not tested on this hardware.])
-	fi
 fi
-# All modes use -march=native and -ffp-contract=off (no FMA contraction, bit-exact with the fork).
-# sse2 adds -mno-avx, which also removes FMA and drops the lane count to SSE2 width.
+# Explicit x86 modes must match this host's ISA (checked with -march=native, which
+# reflects the host CPU). Without this, a mode the CPU lacks would build and then
+# die with SIGILL at run time. neon is checked by its own probe above.
 case $arch in
-	no|none ) FLAG_ARCH=""; TARGET_ARCH="" ;;
+	avx512 | avx | sse2 | native | legacy-avx | legacy-sse2 )
+		case $arch in
+			avx512 ) host_isa='defined(__AVX512F__) && defined(__AVX512DQ__)'; host_name=AVX-512F/DQ ;;
+			avx | legacy-avx ) host_isa='defined(__AVX__)'; host_name=AVX ;;
+			*) host_isa='defined(__SSE2__)'; host_name=SSE2 ;;
+		esac
+		AC_LANG_PUSH([C++])
+		ac_save_CXXFLAGS=$CXXFLAGS
+		CXXFLAGS="$CXXFLAGS -march=native"
+		AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [[
+#if !(defined(__x86_64__) || defined(__i386__))
+#error --enable-arch needs an x86 target for this mode
+#endif
+#if !($host_isa)
+#error host CPU lacks the ISA this mode requires
+#endif
+]])], [host_ok=yes], [host_ok=no])
+		CXXFLAGS=$ac_save_CXXFLAGS
+		AC_LANG_POP([C++])
+		if test x$host_ok = xno; then
+			AC_MSG_ERROR([--enable-arch=$arch needs $host_name on an x86 host, and this target does not provide it. Choose a mode this machine supports, or use --enable-arch=auto.])
+		fi
+		;;
+esac
+
+#   native  : -march=native, widest vectors the host supports (512-bit preferred).
+#   avx512  : AVX-512F/DQ, 512-bit vectors: 16 float lanes, 8 double lanes.
+#   avx     : AVX/AVX2 width (256-bit): 8 float lanes, 4 double lanes. AVX-512 disabled.
+#   sse2    : SSE2 width (128-bit): 4 float lanes, 2 double lanes. AVX and FMA disabled.
+#   neon    : ARM NEON (128-bit). AArch64: -march=armv8-a, 4 float / 2 double lanes.
+#             32-bit ARMv7: -march=armv7-a -mfpu=neon, 4 float lanes; NEON has no
+#             double-precision SIMD there, so double uses scalar (1-lane) code.
+#             The Charm build must use the same float ABI (hard or soft) as ChaNGa.
+#   legacy-sse2 / legacy-avx : the pristine fork's Charm intrinsics path (defines
+#             CMK_USE_SSE2 / CMK_USE_AVX, so CMK_SSE is set and the fork kernels are
+#             compiled instead of the native std::experimental::simd kernels).
+#             Chosen by auto only when the compiler lacks C++17 std::experimental::simd.
+#             Deprecated --enable-sse2 and --enable-avx map here to keep their original meaning.
+case $arch in
 	sse2    ) FLAG_ARCH=""; TARGET_ARCH="-march=native -mno-avx -ffp-contract=off" ;;
-	avx     ) FLAG_ARCH=""; TARGET_ARCH="-march=native -ffp-contract=off" ;;
-	native  ) FLAG_ARCH=""; TARGET_ARCH="-march=native -ffp-contract=off" ;;
+	avx     ) FLAG_ARCH=""; TARGET_ARCH="-march=native -mno-avx512f -ffp-contract=off" ;;
+	legacy-sse2 ) FLAG_ARCH=-DCMK_USE_SSE2; TARGET_ARCH="-march=native -mno-avx -ffp-contract=off" ;;
+	legacy-avx  ) FLAG_ARCH=-DCMK_USE_AVX;  TARGET_ARCH="-march=native -mno-avx512f -ffp-contract=off" ;;
+	avx512  ) FLAG_ARCH=""; TARGET_ARCH="-march=native -mavx512f -mavx512dq -mprefer-vector-width=512 -ffp-contract=off" ;;
+	native  ) FLAG_ARCH=""; TARGET_ARCH="-march=native -mprefer-vector-width=512 -ffp-contract=off" ;;
+	neon    ) FLAG_ARCH=""; TARGET_ARCH="$neon_flags -ffp-contract=off" ;;
 	*       ) AC_MSG_ERROR([invalid argument for '--enable-arch': $arch]) ;;
 esac
 AC_SUBST([FLAG_ARCH])
 AC_SUBST([TARGET_ARCH])
+# legacy-*: SSEdefs.h silently drops CMK_USE_AVX / CMK_USE_SSE2 when the target
+# lacks the ISA, which would fall back to the native kernels without any sign.
+# Check the explicit choice against its own target flags so configure stops instead.
+case $arch in
+	legacy-avx | legacy-sse2 )
+		AC_LANG_PUSH([C++])
+		ac_save_CXXFLAGS=$CXXFLAGS
+		CXXFLAGS="$CXXFLAGS $TARGET_ARCH"
+		if test x$arch = xlegacy-avx; then
+			AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [[
+#if !defined(__AVX__)
+#error no AVX on this target
+#endif
+]])], [], [AC_MSG_ERROR([--enable-arch=legacy-avx requires an AVX target])])
+		else
+			AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [[
+#if !defined(__SSE2__)
+#error no SSE2 on this target
+#endif
+]])], [], [AC_MSG_ERROR([--enable-arch=legacy-sse2 requires an x86 target with SSE2])])
+		fi
+		CXXFLAGS=$ac_save_CXXFLAGS
+		AC_LANG_POP([C++])
+		AC_MSG_NOTICE([legacy: fork Charm intrinsics kernels selected ($arch)])
+		;;
+esac
 
 # -----------------------------------------------------------------------------
 # ---- Gravity Options --------------------------------------------------------

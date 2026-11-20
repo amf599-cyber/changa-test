@@ -4,6 +4,8 @@
 *.def.h
 config.*
 !config.h.in
+!config.guess
+!config.sub
 Makefile
 charmrun
 ChaNGa*

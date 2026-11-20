@@ -680,6 +680,7 @@ OPT_DEBUG
 CLANG_COMPILER
 INTEL_COMPILER
 GNU_COMPILER
+CXX_STD
 EGREP
 GREP
 ac_ct_CC
@@ -1418,8 +1419,14 @@ Optional Features:
   --enable-FEATURE[=ARG]  include FEATURE [ARG=yes]
   --enable-sse2           DEPRECATED. Use --enable-arch=sse2
   --enable-avx            DEPRECATED. Use --enable-arch=avx
-  --enable-arch=MODE      SIMD mode: auto (default, probe host), sse2, avx,
-                          native
+  --enable-arch=MODE      SIMD mode: auto (default: native when the compiler
+                          has C++17 std::experimental::simd, else legacy-avx
+                          or legacy-sse2 by host ISA), native (widest the host
+                          supports via -march=native), avx512 (16/8 lanes),
+                          avx (8/4), sse2 (4/2), neon (ARM NEON, 128-bit: 4/2
+                          lanes on AArch64, 4/0 on ARMv7 where double SIMD is
+                          absent), legacy-avx / legacy-sse2 (pristine fork
+                          Charm intrinsics path, x86 only)
   --enable-float          use single-precision gravity calculations
   --enable-hexadecapole   hexadecapole expansions in gravity
   --enable-changesoft     physical softening
@@ -2821,6 +2828,11 @@ printf '%s\n' "#define NBODY_PACKAGE_VERSION $PACKAGE_VERSION" >>confdefs.h
 
 
 
+# Remove files produced by a previous configure run so a regenerated
+# configuration never mixes with stale settings. The list mirrors dist-clean
+# in Makefile.in; config.h.in and configure itself are sources and are kept.
+rm -f config.status config.log config.cache config.h Makefile cuda.mk ChaNGa charmrun
+
 # Save the user-provided flags
 # NOTE: This must be done _before_ the Charm scripts are imported
 #       as they provide their own values for these flags.
@@ -2947,6 +2959,12 @@ fi
 
 test "$HAVE_GIT" == "no" && as_fn_error $? "git not found" "$LINENO" 5
 
+# Prerequisites for this build (SIMD layer in SSEdefs.h, gravity in gravity.h):
+#   - Charm++ at least MINIMUM_CHARM_VERSION (charmc from CHARM_DIR or PATH)
+#   - A C++17 compiler (-std=c++17) that ships <experimental/simd>:
+#     GCC >= 11 or Clang with libstdc++ >= 11
+#   - No Charm SIMD intrinsics are used; the arch selector reads compiler
+#     macros only, so it works on x86-64 and AArch64 alike.
 MINIMUM_CHARM_VERSION=60800
 if test $($CHARMC -V | awk '{print $3}') -lt $MINIMUM_CHARM_VERSION; then
 	as_fn_error $? "At least Charm++ $MINIMUM_CHARM_VERSION is required" "$LINENO" 5
@@ -4889,24 +4907,30 @@ printf '%s\n' "$ac_cv_path_GREP" >&6; }
 
 
 
-# Require C++11
-
-	{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking whether $CXX supports -std=c++11" >&5
-printf %s "checking whether $CXX supports -std=c++11... " >&6; }
-	ac_ext=cpp
+# Language standard. C++17 is needed for native std::experimental::simd. If the
+# compiler lacks it, the build uses C++11 (the pristine fork's standard) and auto
+# falls back to a legacy-* mode.
+ac_ext=cpp
 ac_cpp='$CXXCPP $CPPFLAGS'
 ac_compile='$CXX -c $CXXFLAGS $CPPFLAGS conftest.$ac_ext >&5'
 ac_link='$CXX -o conftest$ac_exeext $CXXFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ext $LIBS >&5'
 ac_compiler_gnu=$ac_cv_cxx_compiler_gnu
 
-	ac_saved_cxxflags="$CXXFLAGS"
-	CXXFLAGS="-Werror -std=c++11"
-	cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking whether $CXX supports -std=c++17" >&5
+printf %s "checking whether $CXX supports -std=c++17... " >&6; }
+ac_saved_cxxflags="$CXXFLAGS"
+CXXFLAGS="$CXXFLAGS -std=c++17"
+
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
 /* end confdefs.h.  */
 
 int
 main (void)
 {
+
+#if __cplusplus < 201703L
+#error not C++17
+#endif
 
   ;
   return 0;
@@ -4914,21 +4938,68 @@ main (void)
 _ACEOF
 if ac_fn_cxx_try_compile "$LINENO"
 then :
-  { printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: yes" >&5
-printf '%s\n' "yes" >&6; }
+  have_cxx17=yes
 else case e in #(
-  e) as_fn_error $? "ChaNGa requires full C++11 support" "$LINENO" 5
-	 ;;
+  e) have_cxx17=no ;;
 esac
 fi
 rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
-	CXXFLAGS="$ac_saved_cxxflags"
-	ac_ext=c
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $have_cxx17" >&5
+printf '%s\n' "$have_cxx17" >&6; }
+CXXFLAGS="$ac_saved_cxxflags"
+ac_ext=c
 ac_cpp='$CPP $CPPFLAGS'
 ac_compile='$CC -c $CFLAGS $CPPFLAGS conftest.$ac_ext >&5'
 ac_link='$CC -o conftest$ac_exeext $CFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ext $LIBS >&5'
 ac_compiler_gnu=$ac_cv_c_compiler_gnu
 
+if test x$have_cxx17 = xyes; then cxx_std=c++17; else cxx_std=c++11; fi
+CXX_STD=$cxx_std
+
+
+# Probe the std::experimental::simd header (Parallelism TS v2). Not fatal here:
+# auto uses the result to choose native or the legacy fallback, and explicit
+# native-family modes check it below. The legacy-* modes do not need it.
+ac_ext=cpp
+ac_cpp='$CXXCPP $CPPFLAGS'
+ac_compile='$CXX -c $CXXFLAGS $CPPFLAGS conftest.$ac_ext >&5'
+ac_link='$CXX -o conftest$ac_exeext $CXXFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ext $LIBS >&5'
+ac_compiler_gnu=$ac_cv_cxx_compiler_gnu
+
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking for <experimental/simd>" >&5
+printf %s "checking for <experimental/simd>... " >&6; }
+ac_saved_cxxflags="$CXXFLAGS"
+CXXFLAGS="$CXXFLAGS -std=c++17"
+have_stdx_simd=no
+if test x$have_cxx17 = xyes; then
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+#include <experimental/simd>
+int
+main (void)
+{
+
+  std::experimental::native_simd<float> v(1.0f);
+  (void) v;
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_cxx_try_compile "$LINENO"
+then :
+  have_stdx_simd=yes
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+fi
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $have_stdx_simd" >&5
+printf '%s\n' "$have_stdx_simd" >&6; }
+CXXFLAGS="$ac_saved_cxxflags"
+ac_ext=c
+ac_cpp='$CPP $CPPFLAGS'
+ac_compile='$CC -c $CFLAGS $CPPFLAGS conftest.$ac_ext >&5'
+ac_link='$CC -o conftest$ac_exeext $CFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ext $LIBS >&5'
+ac_compiler_gnu=$ac_cv_c_compiler_gnu
 
 
 # Require dependency-generation flags
@@ -5106,20 +5177,27 @@ else case e in #(
 esac
 fi
 
-if test x$arch = xauto -a x$flag_sse_deprecated != x; then arch=$flag_sse_deprecated; fi
-if test x$arch = xauto -a x$flag_avx_deprecated != x; then arch=$flag_avx_deprecated; fi
-# auto: pick the widest double-precision mode this host supports. Float is never chosen
+if test x$arch = xauto -a x$flag_sse_deprecated != x; then arch=legacy-sse2; fi
+if test x$arch = xauto -a x$flag_avx_deprecated != x; then arch=legacy-avx; fi
+# auto: the default. If the compiler provides C++17 std::experimental::simd (and
+# the host has a SIMD target), use native: the widest vectors -march=native gives
+# (AVX-512, AVX, SSE2, or ARM NEON). If it does not, fall back to the legacy mode
+# that matches the host ISA: legacy-avx for AVX, legacy-sse2 for SSE2. A host with
+# neither has no usable SIMD path, so configure stops. Float is never chosen
 # automatically; use --enable-float for it.
 if test x$arch = xauto; then
-	ac_ext=cpp
+	if test x$have_stdx_simd = xyes; then
+		arch=native
+	else
+		ac_ext=cpp
 ac_cpp='$CXXCPP $CPPFLAGS'
 ac_compile='$CXX -c $CXXFLAGS $CPPFLAGS conftest.$ac_ext >&5'
 ac_link='$CXX -o conftest$ac_exeext $CXXFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ext $LIBS >&5'
 ac_compiler_gnu=$ac_cv_cxx_compiler_gnu
 
-	ac_save_CXXFLAGS=$CXXFLAGS
-	CXXFLAGS="$CXXFLAGS -march=native"
-	cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+		ac_save_CXXFLAGS=$CXXFLAGS
+		CXXFLAGS="$CXXFLAGS -march=native"
+		cat confdefs.h - <<_ACEOF >conftest.$ac_ext
 /* end confdefs.h.  */
 
 int
@@ -5136,21 +5214,22 @@ main (void)
 _ACEOF
 if ac_fn_cxx_try_compile "$LINENO"
 then :
-  arch=native
+  arch=legacy-avx
 else case e in #(
-  e) arch=sse2 ;;
+  e) arch= ;;
 esac
 fi
 rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
-	cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+		if test x$arch = x; then
+			cat confdefs.h - <<_ACEOF >conftest.$ac_ext
 /* end confdefs.h.  */
 
 int
 main (void)
 {
 
-#if !defined(__AVX512F__)
-#error no AVX-512 on this host
+#if !defined(__x86_64__) && !defined(__i386__)
+#error not x86
 #endif
 
   ;
@@ -5159,12 +5238,96 @@ main (void)
 _ACEOF
 if ac_fn_cxx_try_compile "$LINENO"
 then :
-  avx512_host=yes
+  arch=legacy-sse2
 else case e in #(
-  e) avx512_host=no ;;
+  e) arch= ;;
 esac
 fi
 rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+		fi
+		if test x$arch = x; then
+			as_fn_error $? "no usable SIMD path: the compiler lacks C++17 <experimental/simd> and the host has neither AVX nor SSE2 for the legacy fallback. Use a compiler with C++17 std::experimental::simd (GCC 11+ with libstdc++)." "$LINENO" 5
+		fi
+		CXXFLAGS=$ac_save_CXXFLAGS
+		ac_ext=c
+ac_cpp='$CPP $CPPFLAGS'
+ac_compile='$CC -c $CFLAGS $CPPFLAGS conftest.$ac_ext >&5'
+ac_link='$CC -o conftest$ac_exeext $CFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ext $LIBS >&5'
+ac_compiler_gnu=$ac_cv_c_compiler_gnu
+
+	fi
+	{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: auto: selected SIMD mode is $arch" >&5
+printf '%s\n' "$as_me: auto: selected SIMD mode is $arch" >&6;}
+fi
+# Explicit native-family modes need std::experimental::simd; legacy-* modes do not.
+if test x$have_stdx_simd = xno; then
+	case $arch in
+		legacy-* ) ;;
+		* ) as_fn_error $? "--enable-arch=$arch requires C++17 <experimental/simd> (GCC >= 11); use a legacy-* mode or a newer compiler" "$LINENO" 5 ;;
+	esac
+fi
+# neon: the target's own NEON flags. AArch64 has NEON built in, so -march=armv8-a is
+# enough. 32-bit ARM needs ARMv7 NEON enabled explicitly. The probe makes the choice
+# from the compiler's view of the target, so cross builds get the right flags.
+if test x$arch = xneon; then
+	ac_ext=cpp
+ac_cpp='$CXXCPP $CPPFLAGS'
+ac_compile='$CXX -c $CXXFLAGS $CPPFLAGS conftest.$ac_ext >&5'
+ac_link='$CXX -o conftest$ac_exeext $CXXFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ext $LIBS >&5'
+ac_compiler_gnu=$ac_cv_cxx_compiler_gnu
+
+	ac_save_CXXFLAGS=$CXXFLAGS
+	cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+int
+main (void)
+{
+
+#if !defined(__ARM_NEON)
+#error no ARM NEON on this target
+#endif
+#if !defined(__aarch64__)
+#error not AArch64
+#endif
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_cxx_try_compile "$LINENO"
+then :
+  neon_flags="-march=armv8-a"
+else case e in #(
+  e) neon_flags= ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+	if test x"$neon_flags" = x; then
+		cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+int
+main (void)
+{
+
+#if !defined(__ARM_NEON)
+#error no ARM NEON on this target
+#endif
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_cxx_try_compile "$LINENO"
+then :
+  neon_flags="-march=armv7-a -mfpu=neon"
+else case e in #(
+  e) as_fn_error $? "--enable-arch=neon requires an ARM target with NEON" "$LINENO" 5 ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+	fi
 	CXXFLAGS=$ac_save_CXXFLAGS
 	ac_ext=c
 ac_cpp='$CPP $CPPFLAGS'
@@ -5172,24 +5335,162 @@ ac_compile='$CC -c $CFLAGS $CPPFLAGS conftest.$ac_ext >&5'
 ac_link='$CC -o conftest$ac_exeext $CFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ext $LIBS >&5'
 ac_compiler_gnu=$ac_cv_c_compiler_gnu
 
-	{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: auto: host SIMD mode is $arch (AVX-512 host: $avx512_host)" >&5
-printf '%s\n' "$as_me: auto: host SIMD mode is $arch (AVX-512 host: $avx512_host)" >&6;}
-	if test x$avx512_host = xyes; then
-		{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: WARNING: AVX-512 host: -march=native selects 8-lane double kernels. Not tested on this hardware." >&5
-printf '%s\n' "$as_me: WARNING: AVX-512 host: -march=native selects 8-lane double kernels. Not tested on this hardware." >&2;}
-	fi
 fi
-# All modes use -march=native and -ffp-contract=off (no FMA contraction, bit-exact with the fork).
-# sse2 adds -mno-avx, which also removes FMA and drops the lane count to SSE2 width.
+# Explicit x86 modes must match this host's ISA (checked with -march=native, which
+# reflects the host CPU). Without this, a mode the CPU lacks would build and then
+# die with SIGILL at run time. neon is checked by its own probe above.
 case $arch in
-	no|none ) FLAG_ARCH=""; TARGET_ARCH="" ;;
+	avx512 | avx | sse2 | native | legacy-avx | legacy-sse2 )
+		case $arch in
+			avx512 ) host_isa='defined(__AVX512F__) && defined(__AVX512DQ__)'; host_name=AVX-512F/DQ ;;
+			avx | legacy-avx ) host_isa='defined(__AVX__)'; host_name=AVX ;;
+			*) host_isa='defined(__SSE2__)'; host_name=SSE2 ;;
+		esac
+		ac_ext=cpp
+ac_cpp='$CXXCPP $CPPFLAGS'
+ac_compile='$CXX -c $CXXFLAGS $CPPFLAGS conftest.$ac_ext >&5'
+ac_link='$CXX -o conftest$ac_exeext $CXXFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ext $LIBS >&5'
+ac_compiler_gnu=$ac_cv_cxx_compiler_gnu
+
+		ac_save_CXXFLAGS=$CXXFLAGS
+		CXXFLAGS="$CXXFLAGS -march=native"
+		cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+int
+main (void)
+{
+
+#if !(defined(__x86_64__) || defined(__i386__))
+#error --enable-arch needs an x86 target for this mode
+#endif
+#if !($host_isa)
+#error host CPU lacks the ISA this mode requires
+#endif
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_cxx_try_compile "$LINENO"
+then :
+  host_ok=yes
+else case e in #(
+  e) host_ok=no ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+		CXXFLAGS=$ac_save_CXXFLAGS
+		ac_ext=c
+ac_cpp='$CPP $CPPFLAGS'
+ac_compile='$CC -c $CFLAGS $CPPFLAGS conftest.$ac_ext >&5'
+ac_link='$CC -o conftest$ac_exeext $CFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ext $LIBS >&5'
+ac_compiler_gnu=$ac_cv_c_compiler_gnu
+
+		if test x$host_ok = xno; then
+			as_fn_error $? "--enable-arch=$arch needs $host_name on an x86 host, and this target does not provide it. Choose a mode this machine supports, or use --enable-arch=auto." "$LINENO" 5
+		fi
+		;;
+esac
+
+#   native  : -march=native, widest vectors the host supports (512-bit preferred).
+#   avx512  : AVX-512F/DQ, 512-bit vectors: 16 float lanes, 8 double lanes.
+#   avx     : AVX/AVX2 width (256-bit): 8 float lanes, 4 double lanes. AVX-512 disabled.
+#   sse2    : SSE2 width (128-bit): 4 float lanes, 2 double lanes. AVX and FMA disabled.
+#   neon    : ARM NEON (128-bit). AArch64: -march=armv8-a, 4 float / 2 double lanes.
+#             32-bit ARMv7: -march=armv7-a -mfpu=neon, 4 float lanes; NEON has no
+#             double-precision SIMD there, so double uses scalar (1-lane) code.
+#             The Charm build must use the same float ABI (hard or soft) as ChaNGa.
+#   legacy-sse2 / legacy-avx : the pristine fork's Charm intrinsics path (defines
+#             CMK_USE_SSE2 / CMK_USE_AVX, so CMK_SSE is set and the fork kernels are
+#             compiled instead of the native std::experimental::simd kernels).
+#             Chosen by auto only when the compiler lacks C++17 std::experimental::simd.
+#             Deprecated --enable-sse2 and --enable-avx map here to keep their original meaning.
+case $arch in
 	sse2    ) FLAG_ARCH=""; TARGET_ARCH="-march=native -mno-avx -ffp-contract=off" ;;
-	avx     ) FLAG_ARCH=""; TARGET_ARCH="-march=native -ffp-contract=off" ;;
-	native  ) FLAG_ARCH=""; TARGET_ARCH="-march=native -ffp-contract=off" ;;
+	avx     ) FLAG_ARCH=""; TARGET_ARCH="-march=native -mno-avx512f -ffp-contract=off" ;;
+	legacy-sse2 ) FLAG_ARCH=-DCMK_USE_SSE2; TARGET_ARCH="-march=native -mno-avx -ffp-contract=off" ;;
+	legacy-avx  ) FLAG_ARCH=-DCMK_USE_AVX;  TARGET_ARCH="-march=native -mno-avx512f -ffp-contract=off" ;;
+	avx512  ) FLAG_ARCH=""; TARGET_ARCH="-march=native -mavx512f -mavx512dq -mprefer-vector-width=512 -ffp-contract=off" ;;
+	native  ) FLAG_ARCH=""; TARGET_ARCH="-march=native -mprefer-vector-width=512 -ffp-contract=off" ;;
+	neon    ) FLAG_ARCH=""; TARGET_ARCH="$neon_flags -ffp-contract=off" ;;
 	*       ) as_fn_error $? "invalid argument for '--enable-arch': $arch" "$LINENO" 5 ;;
 esac
 
 
+# legacy-*: SSEdefs.h silently drops CMK_USE_AVX / CMK_USE_SSE2 when the target
+# lacks the ISA, which would fall back to the native kernels without any sign.
+# Check the explicit choice against its own target flags so configure stops instead.
+case $arch in
+	legacy-avx | legacy-sse2 )
+		ac_ext=cpp
+ac_cpp='$CXXCPP $CPPFLAGS'
+ac_compile='$CXX -c $CXXFLAGS $CPPFLAGS conftest.$ac_ext >&5'
+ac_link='$CXX -o conftest$ac_exeext $CXXFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ext $LIBS >&5'
+ac_compiler_gnu=$ac_cv_cxx_compiler_gnu
+
+		ac_save_CXXFLAGS=$CXXFLAGS
+		CXXFLAGS="$CXXFLAGS $TARGET_ARCH"
+		if test x$arch = xlegacy-avx; then
+			cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+int
+main (void)
+{
+
+#if !defined(__AVX__)
+#error no AVX on this target
+#endif
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_cxx_try_compile "$LINENO"
+then :
+
+else case e in #(
+  e) as_fn_error $? "--enable-arch=legacy-avx requires an AVX target" "$LINENO" 5 ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+		else
+			cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+int
+main (void)
+{
+
+#if !defined(__SSE2__)
+#error no SSE2 on this target
+#endif
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_cxx_try_compile "$LINENO"
+then :
+
+else case e in #(
+  e) as_fn_error $? "--enable-arch=legacy-sse2 requires an x86 target with SSE2" "$LINENO" 5 ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+		fi
+		CXXFLAGS=$ac_save_CXXFLAGS
+		ac_ext=c
+ac_cpp='$CPP $CPPFLAGS'
+ac_compile='$CC -c $CFLAGS $CPPFLAGS conftest.$ac_ext >&5'
+ac_link='$CC -o conftest$ac_exeext $CFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ext $LIBS >&5'
+ac_compiler_gnu=$ac_cv_c_compiler_gnu
+
+		{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: legacy: fork Charm intrinsics kernels selected ($arch)" >&5
+printf '%s\n' "$as_me: legacy: fork Charm intrinsics kernels selected ($arch)" >&6;}
+		;;
+esac
 
 # -----------------------------------------------------------------------------
 # ---- Gravity Options --------------------------------------------------------

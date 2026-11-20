@@ -9,6 +9,8 @@
 #include "Vector3D.h"
 #include "TaggedVector3D.h"
 #include "OrientedBox.h"
+// `using namespace std;` was removed: under C++17 std::byte collides with
+// Charm's global byte typedef (liveViz0.h). Names here are std:: qualified.
 
 #define XDIM 0
 #define YDIM 1

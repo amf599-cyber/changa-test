@@ -299,8 +299,15 @@ void GravityCompute::recvdParticles(ExternalGravityParticle *part,int num,int ch
 #ifdef HPM_COUNTER
     hpmStart(2,"particle force");
 #endif
-    computed = partBucketForce(&part[i], offset,
+// Every CMK_SSE / #else pair below follows one convention: legacy intrinsic
+// builds keep the original AoS kernels, while the native path stages the
+// bucket into a BucketSoA (TreePiece::bucketSoAFor) and calls the *Native kernels.
+#if CMK_SSE
+    computed = partBucketForce(&part[i], reqnode, tp->myParticles, offset, activeRung);
+#else
+    computed = partBucketForceNative(&part[i], offset,
         tp->bucketSoAFor(reqIDlist, reqnode, activeRung));
+#endif
 #ifdef HPM_COUNTER
     hpmStop(2);
 #endif
@@ -439,12 +446,21 @@ int GravityCompute::doWork(GenericTreeNode *node, TreeWalk *tw,
 #ifdef BENCHMARK_TIME_COMPUTE
     double startTime = CmiWallTimer();
 #endif
+// CMK_SSE: legacy AoS kernel. Native: BucketSoA batch (see note above).
+#if CMK_SSE
     int computed = nodeBucketForce(node,
+                    (GenericTreeNode *)computeEntity,
+                    tp->getParticles(),
+                    tp->decodeOffset(reqID),
+                    activeRung);
+#else
+    int computed = nodeBucketForceNative(node,
                     (GenericTreeNode *)computeEntity,
                     tp->decodeOffset(reqID),
                     tp->bucketSoAFor(decodeReqID(reqID),
                                      (GenericTreeNode *)computeEntity,
                                      activeRung));
+#endif
     
     GenericTreeNode *b = (GenericTreeNode *)computeEntity;
     updateInterMass(b->particlePointer,b->firstParticle,b->lastParticle,node->moments.totalMass);
@@ -487,14 +503,25 @@ int GravityCompute::doWork(GenericTreeNode *node, TreeWalk *tw,
       double startTime = CmiWallTimer();
 #endif
       Vector3D<cosmoType> offset = tp->decodeOffset(reqID);
+// CMK_SSE: legacy AoS kernel. Native: BucketSoA batch (see note above).
+#if CMK_SSE
+      for(int i = node->firstParticle; i <= node->lastParticle; i++){
+        computed += partBucketForce(
+                                  &part[i-node->firstParticle],
+                                  (GenericTreeNode *)computeEntity,
+                                  tp->getParticles(),
+                                  offset,
+                                  activeRung);
+#else
       BucketSoA &bs = tp->bucketSoAFor(decodeReqID(reqID),
                                        (GenericTreeNode *)computeEntity,
                                        activeRung);
       for(int i = node->firstParticle; i <= node->lastParticle; i++){
-        computed += partBucketForce(
+        computed += partBucketForceNative(
                                   &part[i-node->firstParticle],
                                   offset,
                                   bs);
+#endif
 
         GenericTreeNode *b = (GenericTreeNode *)computeEntity;
         updateInterMass(b->particlePointer,b->firstParticle,b->lastParticle,&part[i-node->firstParticle],offset);
@@ -599,15 +626,27 @@ int GravityCompute::computeParticleForces(TreePiece *ownerTP, GenericTreeNode *n
 #ifdef BENCHMARK_TIME_COMPUTE
   double startTime = CmiWallTimer();
 #endif
+// CMK_SSE: legacy AoS kernel. Native: BucketSoA batch (see note above).
+#if CMK_SSE
+  for(int i = node->firstParticle; i <= node->lastParticle; i++){
+    computed += partBucketForce(
+                                  &part[i-node->firstParticle],
+                                  (GenericTreeNode *)computeEntity,
+                                  ownerTP->getParticles(),
+                                  ownerTP->decodeOffset(reqID),
+                                  activeRung);
+  }
+#else
   BucketSoA &bs = ownerTP->bucketSoAFor(decodeReqID(reqID),
                                         (GenericTreeNode *)computeEntity,
                                         activeRung);
   for(int i = node->firstParticle; i <= node->lastParticle; i++){
-    computed += partBucketForce(
+    computed += partBucketForceNative(
                                   &part[i-node->firstParticle],
                                   ownerTP->decodeOffset(reqID),
                                   bs);
   }
+#endif
 #ifdef BENCHMARK_TIME_COMPUTE
   computeTimePart += CmiWallTimer() - startTime;
 #endif
@@ -1311,6 +1350,7 @@ void ListCompute::fillLists(State *state_, TreePiece *tp, int chunk, int start,
 template<class type> int calcNodeForces(TreePiece *tp, int b, int activeRung,
     CkVec<type>& clist) {
 
+  GravityParticle *particles = tp->getParticles();
   int computed = 0;
   for(unsigned int i = 0; i < clist.length(); i++){
 
@@ -1325,10 +1365,18 @@ template<class type> int calcNodeForces(TreePiece *tp, int b, int activeRung,
       continue;
     }
 #endif
+// CMK_SSE: legacy AoS kernel. Native: BucketSoA batch (see note above).
+#if CMK_SSE
     computed +=  nodeBucketForce(clist[i].node,
+        tp->getBucket(b),
+        particles,
+        tp->decodeOffset(clist[i].offsetID), activeRung);
+#else
+    computed +=  nodeBucketForceNative(clist[i].node,
         tp->getBucket(b),
         tp->decodeOffset(clist[i].offsetID),
         tp->bucketSoAFor(b, tp->getBucket(b), activeRung));
+#endif
 #ifdef CHANGA_REFACTOR_PRINT_INTERACTIONS
     if(b == TEST_BUCKET && tp->getIndex() == TEST_TP){
       Vector3D<double> vec = tp->decodeOffset(clist[i].offsetID);
@@ -1342,6 +1390,7 @@ template<class type> int calcNodeForces(TreePiece *tp, int b, int activeRung,
 template<class type> int calcParticleForces(TreePiece *tp, int b, int activeRung,
     CkVec<type>& clist) {
 
+  GravityParticle *particles = tp->getParticles();
   int computed = 0;
   // for each bunch of particles in list
   for(unsigned int i = 0; i < clist.length(); i++){
@@ -1355,9 +1404,17 @@ template<class type> int calcParticleForces(TreePiece *tp, int b, int activeRung
 
     // for each particle in a bunch
     for(int j = 0; j < cli.numParticles; j++){
+// CMK_SSE: legacy AoS kernel. Native: BucketSoA batch (see note above).
+#if CMK_SSE
       computed +=  partBucketForce(&cli.particles[j],
+          tp->getBucket(b),
+          particles,
+          cli.offset, activeRung);
+#else
+      computed +=  partBucketForceNative(&cli.particles[j],
           cli.offset,
           tp->bucketSoAFor(b, tp->getBucket(b), activeRung));
+#endif
 
 #ifdef CHANGA_REFACTOR_PRINT_INTERACTIONS
       if(b == TEST_BUCKET && tp->getIndex() == TEST_TP){
@@ -1527,9 +1584,16 @@ void ListCompute::stateReady(State *state_, TreePiece *tp, int chunk, int start,
 	      tmpPart.soft = m.soft;
 	      tmpPart.position = m.cm;
 
-	      partBucketForce(&tmpPart,
+// CMK_SSE: legacy AoS kernel. Native: BucketSoA batch (see note above).
+#if CMK_SSE
+	      GravityParticle *particles = tp->getParticles();
+	      partBucketForce(&tmpPart, bucketNode, particles,
+			      tp->decodeOffset(clist[i].offsetID), activeRung);
+#else
+	      partBucketForceNative(&tmpPart,
 			      tp->decodeOffset(clist[i].offsetID),
 			      tp->bucketSoAFor(b, bucketNode, activeRung));
+#endif
 	      continue;
 	    }
 #endif

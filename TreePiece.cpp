@@ -3812,6 +3812,7 @@ void TreePiece::startNextBucket() {
 #endif
 }
 
+#if !CMK_SSE
 /// Stages bucket b's active particles into its SoA when it is not already
 /// staged. Staging can happen during the walk; calculateEwald/callBucketEwald
 /// and finishBucket suspend the bucket (writing results back to the AoS). A
@@ -3823,6 +3824,7 @@ BucketSoA &TreePiece::bucketSoAFor(int b, Tree::GenericTreeNode *req,
     stageBucket(bs, req, myParticles, activeRung);
   return bs;
 }
+#endif
 
 /*inline*/
 void TreePiece::finishBucket(int iBucket) {
@@ -3841,7 +3843,9 @@ void TreePiece::finishBucket(int iBucket) {
 
   // XXX finished means Ewald is done.
   if(req->finished && remaining == 0) {
+#if !CMK_SSE
     suspendBucket(bucketSoA[iBucket]);
+#endif
     sLocalGravityState->myNumParticlesPending -= 1;
 
 #ifdef COSMO_PRINT_BK
@@ -4226,7 +4230,9 @@ void TreePiece::calculateEwald(dummyMsg *msg) {
     unsigned int i=0;
     while (i < yield_num && ewaldCurrentBucket < numBuckets) {
       if (!useckloop) {
+#if !CMK_SSE
 	suspendBucket(bucketSoA[ewaldCurrentBucket]);
+#endif
 	BucketEwald(bucketList[ewaldCurrentBucket], nReplicas, fEwCut);
       }
 
@@ -4254,7 +4260,9 @@ bool TreePiece::otherIdlePesAvail() {
 }
 
 void TreePiece::callBucketEwald(int id) {
+#if !CMK_SSE
   suspendBucket(bucketSoA[id]);
+#endif
   BucketEwald(bucketList[id], nReplicas, fEwCut);
 }
 

@@ -14,8 +14,7 @@ build_dir := @builddir@
 # and destination file mappings. They can also be used by subprojects.
 define compile-cxx
 @ echo Compiling $*.cpp...
-$(quiet) $(charmc) $(cxx_flags) $(depend_flags) \
-	$(depend_dir)/$*$(depend_suffix) -c++-option -std=$(cxx_std) -c $< -o $@
+$(quiet) $(charmc) $(cxx_flags) -c++-option -std=$(cxx_std) $(depend_flags) $(depend_dir)/$*$(depend_suffix) -c $< -o $@
 endef
 
 define compile-c
@@ -41,9 +40,20 @@ quiet       := $(if $(filter $(VERBOSE),1),,@)
 charmc      := @CHARM_PATH@/bin/charmc $(charm_quiet)
 target      := $(build_dir)/ChaNGa
 charmrun    := charmrun
-cxx_std     := c++17
+# C++ standard: C++17 when the compiler has it (native std::experimental::simd), else
+# C++11, the pristine fork's standard (legacy-* modes only). Set by configure.
+cxx_std     := @CXX_STD@
 c_std       := c99
 opt_flag    := -O3
+# SIMD target flags, chosen by configure --enable-arch=MODE (see configure.ac):
+#   auto (default) probes the host:  avx512 > avx > sse2 on x86, neon on AArch64, else native
+#   native  -march=native, widest vectors the host has (512-bit preferred)
+#   avx512  AVX-512F/DQ, 512-bit: 16 float lanes, 8 double lanes
+#   avx     AVX/AVX2, 256-bit: 8 float lanes, 4 double lanes (AVX-512 disabled)
+#   sse2    SSE2, 128-bit: 4 float lanes, 2 double lanes (AVX and FMA disabled)
+#   neon    AArch64 NEON, 128-bit: 4 float lanes, 2 double lanes
+# Every mode adds -ffp-contract=off so results stay bit-exact with the fork.
+# Lane widths come from std::experimental::simd (native_simd), never hard-coded.
 target_arch := @TARGET_ARCH@
 threads     := -lpthread
 
@@ -249,20 +259,27 @@ $(build_dir)/$(target): $(foreach m,$(changa_modules),libmodule$(m).a)
 $(build_dir)/$(target): $(objects) $(structures_path)/libTipsy.a
 	$(link-charmc)
 ifneq ($(notdir $(charmrun)),charmrun)
-	$(quiet) if [ -e $(build_dir)/charmrun ]; then 									\
-				mv $(build_dir)/charmrun $(build_dir)/$(charmrun);					\
+# Some charm builds (e.g. reconverse) do not provide charmrun, so only
+# rename/link it if charmc actually copied one, and remove dangling links.
+	$(quiet) if [ -f $(build_dir)/charmrun ] && [ ! -L $(build_dir)/charmrun ]; then	\
+				mv -f $(build_dir)/charmrun $(build_dir)/$(charmrun);		\
 			 fi
-	$(quiet) if [ ! -e $(build_dir)/charmrun ]; then 				  			 	\
-				ln -s $(build_dir)/$(charmrun) $(build_dir)/charmrun; 				\
-			 else 													  				\
-			 	echo "$(build_dir)/charmrun already exists. No symlink created."; 	\
-		 	 fi
+	$(quiet) if [ -L $(build_dir)/charmrun ] && [ ! -e $(build_dir)/charmrun ]; then	\
+				$(RM) $(build_dir)/charmrun;					\
+			 fi
+	$(quiet) if [ -e $(build_dir)/$(charmrun) ]; then							\
+				if [ ! -e $(build_dir)/charmrun ]; then						\
+					ln -s $(build_dir)/$(charmrun) $(build_dir)/charmrun;			\
+				else										\
+					echo "$(build_dir)/charmrun already exists. No symlink created.";	\
+				fi;										\
+			 fi
 endif
 ifneq ($(notdir $(target)),ChaNGa)
-	$(quiet) if [ ! -e $(build_dir)/ChaNGa ]; then 									\
-				ln -s $(build_dir)/$(target) $(build_dir)/ChaNGa; 					\
-			 else 																	\
-				echo "$(build_dir)/ChaNGa already exists. No symlink created.";		\
+	$(quiet) if [ ! -e $(build_dir)/ChaNGa ]; then 						\
+				ln -s $(build_dir)/$(target) $(build_dir)/ChaNGa; 		\
+			 else 									\
+				echo "$(build_dir)/ChaNGa already exists. No symlink created.";	\
 			 fi
 endif
 
